@@ -34,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import time
 import uuid
 import zipfile
 from dataclasses import dataclass, field
@@ -45,6 +46,15 @@ from . import config, db
 # Test hook: when set, the GC process exits (os._exit) at this checkpoint.
 # Used by the crash-recovery tests; never set in production.
 CRASH_HOOK: str | None = None
+
+# Test hook: when set, repair_blob() exits (os._exit) right after the
+# replacement file is published but before the serving state is committed.
+REPAIR_CRASH_HOOK: str | None = None
+
+# Test hook: callable invoked by inspect_batch() after the verdict has been
+# computed from the file bytes but before it is committed.  Lets tests
+# interleave a repair (or a stall) at exactly the racy moment.
+INSPECT_PAUSE_HOOK: object = None
 
 
 class UploadError(ValueError):
@@ -118,6 +128,244 @@ def publish(tmp: Path, sha256: str) -> None:
         _fsync_dir(config.BLOB_DIR)
     else:
         tmp.unlink(missing_ok=True)
+
+
+def publish_replace(tmp: Path, sha256: str) -> None:
+    """Atomically replace the original with the staged (verified) bytes.
+
+    ``os.replace`` swaps the directory entry atomically, so concurrent
+    readers keep streaming the old inode and never observe a half-written
+    file; the staged part was fsynced before the rename, so the new bytes
+    are durable.
+    """
+    config.BLOB_DIR.mkdir(parents=True, exist_ok=True)
+    os.replace(tmp, blob_path(sha256))
+    _fsync_dir(config.BLOB_DIR)
+
+
+def new_generation() -> str:
+    """Fresh token marking a change of a blob's published bytes."""
+    return uuid.uuid4().hex
+
+
+def hash_file(path: Path) -> tuple[int, str]:
+    """Stream a file once, returning (size_bytes, sha256 hexdigest)."""
+    digest = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(64 * 1024), b""):
+            size += len(chunk)
+            digest.update(chunk)
+    return size, digest.hexdigest()
+
+
+# --------------------------------------------------------------------------- #
+# Inspection (巡检) and repair (修复)
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class InspectResult:
+    batch_id: str
+    sha256: str
+    registered_size_bytes: int
+    observed_size_bytes: int | None
+    observed_sha256: str | None
+    # ok | missing | mismatch | superseded
+    verdict: str
+    detail: str
+    suspended_batches: list[str] = field(default_factory=list)
+
+
+def _inspect_pause() -> None:
+    """Test-only stall point between hashing the file and committing the
+    verdict.  Two mechanisms, both inert in production:
+
+    * ``INSPECT_PAUSE_HOOK`` - an in-process callable (unit tests).
+    * ``ARCHIVE_INSPECT_GATE_FILE`` - while this path exists, the inspection
+      waits (cross-process gate for the two-instance tests).  A
+      ``<gate>.reached`` marker is touched so the test knows the inspection
+      is parked with its verdict in hand.
+    """
+    if INSPECT_PAUSE_HOOK is not None:
+        INSPECT_PAUSE_HOOK()  # type: ignore[operator]
+    gate = os.environ.get("ARCHIVE_INSPECT_GATE_FILE")
+    if gate and os.path.exists(gate):
+        try:
+            Path(gate + ".reached").touch()
+        except OSError:
+            pass
+        deadline = time.monotonic() + 30.0
+        while os.path.exists(gate) and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+
+def inspect_batch(batch_id: str) -> InspectResult | None:
+    """Verify the shared original behind ``batch_id`` against its
+    registered length and SHA-256, suspending every active referencing
+    batch when the original is missing or does not match.
+
+    Locking: the registration is read without a lock and the file is
+    hashed without any database transaction, so a slow or paused
+    inspection never blocks repairs or unrelated batches.  Only the
+    verdict commit takes the (short) write lock - and it is applied only
+    if the blob's generation is unchanged since the file was read.  A
+    repair that landed in between refreshes the generation, so a stale
+    "bad original" verdict can never suspend an already-repaired original.
+    """
+    conn = db.get_conn()
+    batch = conn.execute(
+        "SELECT sha256, size_bytes FROM batches WHERE batch_id = ?",
+        (batch_id,),
+    ).fetchone()
+    if batch is None:
+        return None
+    sha256 = batch["sha256"]
+    registered = batch["size_bytes"]
+    row = conn.execute(
+        "SELECT generation FROM blobs WHERE sha256 = ?", (sha256,)
+    ).fetchone()
+    g0 = row["generation"] if row is not None else None
+
+    path = blob_path(sha256)
+    if not path.exists():
+        observed_size: int | None = None
+        observed_hash: str | None = None
+        verdict = "missing"
+    else:
+        observed_size, observed_hash = hash_file(path)
+        verdict = (
+            "ok"
+            if observed_size == registered and observed_hash == sha256
+            else "mismatch"
+        )
+
+    _inspect_pause()
+
+    if verdict == "missing":
+        detail = f"shared original {sha256} is missing from storage"
+    elif verdict == "mismatch":
+        detail = (
+            f"shared original {sha256} failed integrity check: registered "
+            f"size {registered} sha256 {sha256}, observed size "
+            f"{observed_size} sha256 {observed_hash}"
+        )
+    else:
+        detail = (
+            f"shared original {sha256} matches registered size and sha256"
+        )
+
+    suspended: list[str] = []
+    with db.transaction() as conn:
+        row = conn.execute(
+            "SELECT generation FROM blobs WHERE sha256 = ?", (sha256,)
+        ).fetchone()
+        g1 = row["generation"] if row is not None else None
+        if g0 != g1:
+            return InspectResult(
+                batch_id=batch_id,
+                sha256=sha256,
+                registered_size_bytes=registered,
+                observed_size_bytes=observed_size,
+                observed_sha256=observed_hash,
+                verdict="superseded",
+                detail=(
+                    "the original changed while the inspection was in "
+                    "flight; the stale verdict was discarded - re-run the "
+                    "inspection"
+                ),
+            )
+        now = conn.execute(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE blobs SET last_inspected_at = ?, "
+            "last_inspect_verdict = ? WHERE sha256 = ?",
+            (now, verdict, sha256),
+        )
+        if verdict != "ok":
+            rows = conn.execute(
+                "SELECT batch_id FROM batches WHERE sha256 = ? "
+                "AND status = 'active' AND suspended_at IS NULL",
+                (sha256,),
+            ).fetchall()
+            suspended = [r["batch_id"] for r in rows]
+            conn.execute(
+                "UPDATE batches SET suspended_at = ?, suspend_reason = ? "
+                "WHERE sha256 = ? AND status = 'active' "
+                "AND suspended_at IS NULL",
+                (now, detail, sha256),
+            )
+
+    return InspectResult(
+        batch_id=batch_id,
+        sha256=sha256,
+        registered_size_bytes=registered,
+        observed_size_bytes=observed_size,
+        observed_sha256=observed_hash,
+        verdict=verdict,
+        detail=detail,
+        suspended_batches=suspended,
+    )
+
+
+def repair_blob(sha256: str, tmp: Path, size_bytes: int) -> list[str]:
+    """Restore a shared original from verified bytes and resume serving.
+
+    The caller guarantees the staged bytes hash to ``sha256`` (the
+    registered digest).  Ordering is crash-safe:
+
+    1. the replacement file is atomically renamed into ``blobs/`` -
+       readers never see a half-written file;
+    2. one transaction refreshes the blob generation (invalidating any
+       inspection verdict computed from the old bytes) and lifts the
+       suspension of every *active* batch referencing the original.
+
+    A crash or write failure between the steps leaves batches suspended
+    (safe: nothing unverified is served) and the repair can simply be
+    retried.  Retired batches are never touched: a retired number stays
+    dead and is never revived.
+    """
+    publish_replace(tmp, sha256)
+    if REPAIR_CRASH_HOOK == "after_publish":
+        os._exit(2)
+    with db.transaction() as conn:
+        row = conn.execute(
+            "SELECT status FROM blobs WHERE sha256 = ?", (sha256,)
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO blobs (sha256, size_bytes, status, generation) "
+                "VALUES (?, ?, 'ready', ?)",
+                (sha256, size_bytes, new_generation()),
+            )
+        elif row["status"] == "deleting":
+            # Reclaim from an in-flight GC, as uploads do.
+            conn.execute(
+                "UPDATE blobs SET status = 'ready', quarantine_path = NULL, "
+                "generation = ? WHERE sha256 = ?",
+                (new_generation(), sha256),
+            )
+            conn.execute("DELETE FROM gc_queue WHERE sha256 = ?", (sha256,))
+        else:
+            conn.execute(
+                "UPDATE blobs SET generation = ? WHERE sha256 = ?",
+                (new_generation(), sha256),
+            )
+        rows = conn.execute(
+            "SELECT batch_id FROM batches WHERE sha256 = ? "
+            "AND status = 'active' AND suspended_at IS NOT NULL",
+            (sha256,),
+        ).fetchall()
+        restored = [r["batch_id"] for r in rows]
+        conn.execute(
+            "UPDATE batches SET suspended_at = NULL, suspend_reason = NULL "
+            "WHERE sha256 = ? AND status = 'active' "
+            "AND suspended_at IS NOT NULL",
+            (sha256,),
+        )
+    # Defensive: drop a stale quarantined copy if one survived.
+    move_back_from_quarantine(sha256)
+    return restored
 
 
 # --------------------------------------------------------------------------- #
@@ -197,9 +445,9 @@ def _finish_phase_two(sha256: str, report: GcReport) -> None:
         ).fetchone()
         if referenced:
             conn.execute(
-                "UPDATE blobs SET status = 'ready', quarantine_path = NULL "
-                "WHERE sha256 = ?",
-                (sha256,),
+                "UPDATE blobs SET status = 'ready', quarantine_path = NULL, "
+                "generation = ? WHERE sha256 = ?",
+                (new_generation(), sha256),
             )
             conn.execute("DELETE FROM gc_queue WHERE sha256 = ?", (sha256,))
             restored = True
@@ -220,13 +468,14 @@ def _finish_phase_two(sha256: str, report: GcReport) -> None:
                     "LIMIT 1",
                     (sha256,),
                 ).fetchone()
+                qfile = quarantine_path(sha256)
                 size_bytes = size_row["size_bytes"] if size_row else (
-                    q.stat().st_size if q.exists() else 0
+                    qfile.stat().st_size if qfile.exists() else 0
                 )
                 conn.execute(
-                    "INSERT INTO blobs (sha256, size_bytes, status) "
-                    "VALUES (?, ?, 'ready')",
-                    (sha256, size_bytes),
+                    "INSERT INTO blobs (sha256, size_bytes, status, "
+                    "generation) VALUES (?, ?, 'ready', ?)",
+                    (sha256, size_bytes, new_generation()),
                 )
             restored = False
 
@@ -357,9 +606,9 @@ def _restore_blob_row(sha256: str) -> None:
     conn = db.get_conn()
     with db.transaction():
         conn.execute(
-            "UPDATE blobs SET status = 'ready', quarantine_path = NULL "
-            "WHERE sha256 = ?",
-            (sha256,),
+            "UPDATE blobs SET status = 'ready', quarantine_path = NULL, "
+            "generation = ? WHERE sha256 = ?",
+            (new_generation(), sha256),
         )
         conn.execute("DELETE FROM gc_queue WHERE sha256 = ?", (sha256,))
     move_back_from_quarantine(sha256)
@@ -392,6 +641,15 @@ def reconcile() -> GcReport:
                 if digest in missing:
                     os.replace(part, blob_path(digest))
                     _fsync_dir(config.BLOB_DIR)
+                    # The original's bytes changed on disk: refresh the
+                    # generation so an in-flight inspection on the other
+                    # instance cannot act on a stale "missing" verdict.
+                    with db.transaction() as conn:
+                        conn.execute(
+                            "UPDATE blobs SET generation = ? "
+                            "WHERE sha256 = ?",
+                            (new_generation(), digest),
+                        )
                     missing.discard(digest)
                     rescued = True
             if not rescued:

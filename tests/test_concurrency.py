@@ -11,6 +11,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -52,7 +53,13 @@ def _wait_healthy(url: str, proc: subprocess.Popen) -> None:
 @pytest.fixture
 def two_instances(data_dir):
     ports = [_free_port(), _free_port()]
-    env_base = dict(os.environ, ARCHIVE_DATA_DIR=str(data_dir))
+    # The inspection gate file only affects inspections while it exists;
+    # tests that do not create it run unimpeded.
+    env_base = dict(
+        os.environ,
+        ARCHIVE_DATA_DIR=str(data_dir),
+        ARCHIVE_INSPECT_GATE_FILE=str(data_dir / "inspect.gate"),
+    )
     procs = []
     for port in ports:
         env = dict(
@@ -298,3 +305,173 @@ def test_concurrent_same_content_upload_then_cross_instance_download(
             r = httpx.get(f"{url}/batches/{batch}/archive", timeout=10)
             assert r.status_code == 200
             assert hashlib.sha256(r.content).hexdigest() == digest
+
+
+def _post_zip(url: str, path: str, batch_id: str, body: bytes) -> httpx.Response:
+    return httpx.post(
+        f"{url}{path}",
+        files={"file": (f"{batch_id}.zip", body, "application/zip")},
+        timeout=20,
+    )
+
+
+def test_inspect_suspend_repair_roundtrip_across_instances(
+    two_instances, data_dir
+):
+    """Corruption detected on one instance suspends both batches on both
+    instances; a repair through the other instance resumes all of them."""
+    base_urls = two_instances
+    body = make_zip({"x": b"cross-instance"})
+    digest = hashlib.sha256(body).hexdigest()
+    with httpx.Client(timeout=15) as c:
+        c.post(f"{base_urls[0]}/batches/X1/archive",
+               files={"file": ("a.zip", body, "application/zip")})
+        c.post(f"{base_urls[1]}/batches/X2/archive",
+               files={"file": ("b.zip", body, "application/zip")})
+
+    # Bad sectors: same length, wrong bytes.
+    (data_dir / "blobs" / digest).write_bytes(os.urandom(len(body)))
+
+    # Inspect via instance A: every active referrer is suspended.
+    r = httpx.post(f"{base_urls[0]}/batches/X1/inspect", timeout=15)
+    assert r.status_code == 200
+    assert r.json()["verdict"] == "mismatch"
+    assert sorted(r.json()["suspended_batches"]) == ["X1", "X2"]
+
+    # Downloads rejected on both instances, reason visible everywhere.
+    for url in base_urls:
+        assert httpx.get(f"{url}/batches/X2/archive").status_code == 409
+        info = httpx.get(f"{url}/batches/X2").json()
+        assert "failed integrity check" in info["suspend_reason"]
+        assert info["serving"] is False
+
+    # Repair via instance B with the retained ZIP: all references resume.
+    r = _post_zip(base_urls[1], "/batches/X2/repair", "X2", body)
+    assert r.status_code == 200
+    assert sorted(r.json()["restored_batches"]) == ["X1", "X2"]
+    for url in base_urls:
+        for batch in ("X1", "X2"):
+            r = httpx.get(f"{url}/batches/{batch}/archive", timeout=10)
+            assert r.status_code == 200
+            assert hashlib.sha256(r.content).hexdigest() == digest
+
+
+def test_stalled_inspection_does_not_block_repair_or_unrelated_batches(
+    two_instances, data_dir
+):
+    """While an inspection is parked (verdict in hand, not yet committed),
+    repairs and unrelated batches must still complete - and the late
+    inspection must not suspend the repaired original."""
+    base_urls = two_instances
+    body = make_zip({"shared": b"stall-test"})
+    other = make_zip({"other": b"unrelated"})
+    digest = hashlib.sha256(body).hexdigest()
+    gate = data_dir / "inspect.gate"
+    reached = data_dir / "inspect.gate.reached"
+
+    with httpx.Client(timeout=15) as c:
+        c.post(f"{base_urls[0]}/batches/STALL-A/archive",
+               files={"file": ("a.zip", body, "application/zip")})
+        c.post(f"{base_urls[1]}/batches/STALL-B/archive",
+               files={"file": ("b.zip", body, "application/zip")})
+        c.post(f"{base_urls[0]}/batches/UNRELATED/archive",
+               files={"file": ("u.zip", other, "application/zip")})
+
+    (data_dir / "blobs" / digest).write_bytes(os.urandom(len(body)))
+
+    # Park inspections between hashing the file and committing the verdict.
+    gate.touch()
+    outcome: dict = {}
+
+    def run_inspection() -> None:
+        r = httpx.post(f"{base_urls[0]}/batches/STALL-A/inspect", timeout=30)
+        outcome["status"] = r.status_code
+        outcome["payload"] = r.json()
+
+    thread = threading.Thread(target=run_inspection)
+    thread.start()
+    try:
+        for _ in range(200):
+            if reached.exists():
+                break
+            time.sleep(0.05)
+        assert reached.exists(), "inspection never reached the pause point"
+
+        # While the inspection is stalled, the repair completes promptly
+        # on the other instance...
+        started = time.monotonic()
+        r = _post_zip(base_urls[1], "/batches/STALL-B/repair", "STALL-B", body)
+        assert r.status_code == 200
+        # ...and unrelated batches keep working on both instances.
+        assert httpx.get(
+            f"{base_urls[0]}/batches/UNRELATED/archive", timeout=10
+        ).status_code == 200
+        assert _post_zip(
+            base_urls[0], "/batches/LATE/archive", "LATE", other
+        ).status_code == 200
+        assert httpx.post(
+            f"{base_urls[1]}/batches/UNRELATED/retire", timeout=10
+        ).status_code == 200
+        assert time.monotonic() - started < 15
+    finally:
+        gate.unlink(missing_ok=True)
+        thread.join(timeout=30)
+    assert not thread.is_alive()
+
+    # The late inspection's stale "corrupt" verdict was discarded: the
+    # repaired original was never re-suspended.
+    assert outcome["status"] == 200
+    assert outcome["payload"]["verdict"] == "superseded"
+    assert outcome["payload"]["suspended_batches"] == []
+    for url in base_urls:
+        for batch in ("STALL-A", "STALL-B"):
+            r = httpx.get(f"{url}/batches/{batch}/archive", timeout=10)
+            assert r.status_code == 200
+            assert hashlib.sha256(r.content).hexdigest() == digest
+
+
+def test_concurrent_inspect_and_repair_converge_to_serving(
+    two_instances, data_dir
+):
+    """Inspections and repairs racing on both instances: whatever the
+    interleaving, the repaired original ends up served and intact."""
+    base_urls = two_instances
+    body = make_zip({"conc": b"inspect-repair-race"})
+    digest = hashlib.sha256(body).hexdigest()
+    with httpx.Client(timeout=15) as c:
+        c.post(f"{base_urls[0]}/batches/CC1/archive",
+               files={"file": ("a.zip", body, "application/zip")})
+        c.post(f"{base_urls[1]}/batches/CC2/archive",
+               files={"file": ("b.zip", body, "application/zip")})
+    (data_dir / "blobs" / digest).write_bytes(os.urandom(len(body)))
+
+    def inspect(url: str, batch: str) -> int:
+        return httpx.post(f"{url}/batches/{batch}/inspect",
+                          timeout=20).status_code
+
+    def repair(url: str, batch: str) -> int:
+        return _post_zip(url, f"/batches/{batch}/repair", batch,
+                         body).status_code
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [
+            pool.submit(inspect, base_urls[0], "CC1"),
+            pool.submit(inspect, base_urls[1], "CC2"),
+            pool.submit(repair, base_urls[0], "CC1"),
+            pool.submit(repair, base_urls[1], "CC2"),
+        ]
+        assert all(f.result() == 200 for f in futures)
+
+    # Final state: the original on disk is the verified one and every
+    # active batch is served by both instances.
+    assert hashlib.sha256(
+        (data_dir / "blobs" / digest).read_bytes()
+    ).hexdigest() == digest
+    for url in base_urls:
+        for batch in ("CC1", "CC2"):
+            r = httpx.get(f"{url}/batches/{batch}/archive", timeout=10)
+            assert r.status_code == 200
+            assert r.content == body
+    summary = httpx.get(f"{base_urls[0]}/storage/summary",
+                        timeout=10).json()
+    assert summary["suspended_batches"] == 0

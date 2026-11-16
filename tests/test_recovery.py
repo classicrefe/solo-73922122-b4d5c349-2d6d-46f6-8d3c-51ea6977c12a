@@ -8,10 +8,14 @@ Scenarios
 2. After the same crash, the content becomes referenced again by a new
    batch: reconciliation must restore the bytes instead of deleting them.
 3. The upload API itself reclaims a blob stuck in the 'deleting' state.
+4. A repair that crashes after publishing the replacement file but before
+   committing the serving state must leave batches suspended (nothing
+   unverified is served) and be retryable after a restart.
 """
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 import subprocess
 import sys
@@ -24,6 +28,7 @@ from conftest import make_zip, upload
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "scripts" / "crash_worker.py"
+REPAIR_WORKER = ROOT / "scripts" / "repair_worker.py"
 
 
 def _run_worker(data_dir: Path, hook: str) -> subprocess.CompletedProcess:
@@ -219,3 +224,96 @@ def test_staged_part_rescues_missing_blob_after_crash(data_dir):
         assert not part.exists()
         summary = c.get("/storage/summary").json()
         assert summary["blob_rows"] == summary["blob_files_on_disk"] == 1
+
+
+def test_repair_crash_after_publish_stays_suspended_then_retry(
+    data_dir, tmp_path
+):
+    """Repair interrupted between the file swap and the state commit.
+
+    After the crash and a restart the batches must stay suspended (only
+    fully verified originals are served, no half-repaired state), and the
+    retained ZIP can simply be re-uploaded to finish the repair.
+    """
+    body = make_zip({"crash": b"repair-crash"})
+    digest = hashlib.sha256(body).hexdigest()
+    with TestClient(app) as c:
+        assert upload(c, "RC1", body).status_code == 200
+        assert upload(c, "RC2", body).status_code == 200
+
+    # Disk corruption, then inspection suspends both referencing batches.
+    (data_dir / "blobs" / digest).write_bytes(os.urandom(len(body)))
+    with TestClient(app) as c:
+        r = c.post("/batches/RC1/inspect")
+        assert sorted(r.json()["suspended_batches"]) == ["RC1", "RC2"]
+        assert c.get("/batches/RC1/archive").status_code == 409
+
+    # Repair from the retained ZIP, hard-crashing after the replacement
+    # file is published but before the serving state is committed.
+    retained = tmp_path / "retained.zip"
+    retained.write_bytes(body)
+    proc = subprocess.run(
+        [sys.executable, "-I", str(REPAIR_WORKER),
+         str(data_dir), str(retained), "after_publish"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 2, proc.stderr
+    # The good bytes are already on disk, but the state switch never
+    # committed.
+    blob_file = data_dir / "blobs" / digest
+    assert hashlib.sha256(blob_file.read_bytes()).hexdigest() == digest
+
+    with TestClient(app) as c:  # restart: reconcile runs
+        # Nothing unverified is served: both batches are still suspended.
+        assert c.get("/batches/RC1/archive").status_code == 409
+        assert c.get("/batches/RC2/archive").status_code == 409
+        summary = c.get("/storage/summary").json()
+        assert summary["suspended_batches"] == 2
+
+        # The interrupted repair can be retried; it completes the switch.
+        r = c.post(
+            "/batches/RC1/repair",
+            files={"file": ("rc1.zip", body, "application/zip")},
+        )
+        assert r.status_code == 200
+        assert sorted(r.json()["restored_batches"]) == ["RC1", "RC2"]
+        assert c.get("/batches/RC1/archive").content == body
+        assert c.get("/batches/RC2/archive").content == body
+        summary = c.get("/storage/summary").json()
+        assert summary["suspended_batches"] == 0
+
+
+def test_repair_crash_before_publish_leaves_no_partial_file(
+    data_dir, tmp_path
+):
+    """A repair dying while staging must not leave a half-written original
+    or any served state change behind."""
+    body = make_zip({"stage": b"stage-crash"})
+    digest = hashlib.sha256(body).hexdigest()
+    with TestClient(app) as c:
+        assert upload(c, "SC1", body).status_code == 200
+
+    (data_dir / "blobs" / digest).write_bytes(os.urandom(len(body)))
+    with TestClient(app) as c:
+        c.post("/batches/SC1/inspect")
+        assert c.get("/batches/SC1/archive").status_code == 409
+
+    # Simulate a repair that crashed after staging but before the atomic
+    # rename: only an orphan tmp part survives.
+    orphan = data_dir / "tmp" / "part-repair-crashed"
+    orphan.write_bytes(body)
+
+    with TestClient(app) as c:  # restart reaps the staged part
+        assert not orphan.exists()
+        # Still suspended (the corrupt file is untouched) - no half state.
+        assert c.get("/batches/SC1/archive").status_code == 409
+        # Retry finishes the repair.
+        r = c.post(
+            "/batches/SC1/repair",
+            files={"file": ("sc1.zip", body, "application/zip")},
+        )
+        assert r.status_code == 200
+        assert r.json()["restored_batches"] == ["SC1"]
+        assert c.get("/batches/SC1/archive").content == body

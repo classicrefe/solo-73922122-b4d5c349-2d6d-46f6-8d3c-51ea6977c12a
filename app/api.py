@@ -31,9 +31,15 @@ class BatchSummary(BaseModel):
     batch_id: str
     sha256: str
     size_bytes: int
+    # Stored state: 'active' or 'retired'.  A suspended batch is still
+    # 'active' - it keeps its number and its reference - but is not served.
     status: str
+    # False while the batch is suspended by an inspection.
+    serving: bool
     created_at: str
     retired_at: str | None
+    suspended_at: str | None
+    suspend_reason: str | None
 
 
 class BatchListResponse(BaseModel):
@@ -43,6 +49,7 @@ class BatchListResponse(BaseModel):
 
 class StorageSummary(BaseModel):
     active_batches: int
+    suspended_batches: int
     retired_batches: int
     # Rows in the blobs table - the number of originals that must exist.
     blob_rows: int
@@ -67,6 +74,29 @@ class UploadResponse(BaseModel):
     sha256: str
     size_bytes: int
     reused_existing_content: bool
+    # Batches whose suspension was lifted because this upload restored the
+    # shared original (empty for ordinary uploads).
+    restored_batches: list[str] = []
+
+
+class InspectResponse(BaseModel):
+    batch_id: str
+    sha256: str
+    registered_size_bytes: int
+    observed_size_bytes: int | None
+    observed_sha256: str | None
+    # ok | missing | mismatch | superseded
+    verdict: str
+    detail: str
+    suspended_batches: list[str]
+
+
+class RepairResponse(BaseModel):
+    batch_id: str
+    sha256: str
+    size_bytes: int
+    # Active batches whose suspension was lifted by the repair.
+    restored_batches: list[str]
 
 
 # --------------------------------------------------------------------------- #
@@ -83,11 +113,14 @@ async def lifespan(app: FastAPI) -> Any:
 
 app = FastAPI(
     title="Sequencing Center Archive Reclamation API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Upload per-batch ZIP archives (deduplicated by SHA-256), "
         "download original bytes, retire batches and garbage-collect "
-        "originals that no batch references anymore."
+        "originals that no batch references anymore.  Inspection "
+        "(巡检) verifies each shared original against its registered "
+        "length/SHA-256 and suspends affected batches; repair (修复) "
+        "restores the original from a retained ZIP and resumes serving."
     ),
     lifespan=lifespan,
 )
@@ -103,8 +136,11 @@ def _batch_to_model(row: Any) -> BatchSummary:
         sha256=row["sha256"],
         size_bytes=row["size_bytes"],
         status=row["status"],
+        serving=row["status"] == "active" and row["suspended_at"] is None,
         created_at=row["created_at"],
         retired_at=row["retired_at"],
+        suspended_at=row["suspended_at"],
+        suspend_reason=row["suspend_reason"],
     )
 
 
@@ -131,7 +167,9 @@ def _validate_batch_id(batch_id: str) -> None:
 def upload_archive(batch_id: str, file: UploadFile = File(...)) -> UploadResponse:
     """Store a batch's ZIP archive (max 2 MiB).
 
-    * Same batch + same SHA-256 re-upload is a no-op success (reuse).
+    * Same batch + same SHA-256 re-upload is a no-op success (reuse); if
+      the shared original is missing or its batches are suspended, the
+      re-upload doubles as a repair and resumes serving.
     * Same batch + different SHA-256 is rejected with 409.
     * Retired batch numbers can never be reused (409).
     * Identical SHA-256 content is stored exactly once on disk.
@@ -149,6 +187,7 @@ def upload_archive(batch_id: str, file: UploadFile = File(...)) -> UploadRespons
 
     try:
         reused = False
+        restored: list[str] = []
         with db.transaction() as conn:
             batch = conn.execute(
                 "SELECT * FROM batches WHERE batch_id = ?", (batch_id,)
@@ -177,17 +216,17 @@ def upload_archive(batch_id: str, file: UploadFile = File(...)) -> UploadRespons
             ).fetchone()
             if blob is None:
                 conn.execute(
-                    "INSERT INTO blobs (sha256, size_bytes, status) "
-                    "VALUES (?, ?, 'ready')",
-                    (sha256, len(body)),
+                    "INSERT INTO blobs (sha256, size_bytes, status, "
+                    "generation) VALUES (?, ?, 'ready', ?)",
+                    (sha256, len(body), storage.new_generation()),
                 )
             elif blob["status"] == "deleting":
                 # GC had marked this content for removal, but a batch now
                 # references it: reclaim it.
                 conn.execute(
-                    "UPDATE blobs SET status = 'ready', quarantine_path = NULL "
-                    "WHERE sha256 = ?",
-                    (sha256,),
+                    "UPDATE blobs SET status = 'ready', quarantine_path = "
+                    "NULL, generation = ? WHERE sha256 = ?",
+                    (storage.new_generation(), sha256),
                 )
                 conn.execute(
                     "DELETE FROM gc_queue WHERE sha256 = ?", (sha256,)
@@ -200,14 +239,36 @@ def upload_archive(batch_id: str, file: UploadFile = File(...)) -> UploadRespons
                     (batch_id, sha256, len(body)),
                 )
 
-        # Transaction committed: publish the bytes (idempotent).  If GC
-        # moved them to quarantine in parallel, move them back; if another
-        # instance already published identical bytes, nothing to do.
-        storage.publish(tmp, sha256)
-        if storage.quarantine_path(sha256).exists():
-            storage.move_back_from_quarantine(sha256)
+            # The committed rows above pin the original (GC cannot reclaim
+            # a referenced blob).  If the original's bytes are gone or
+            # active referrers are suspended, this upload is also a repair:
+            # republish the verified bytes and lift the suspensions.
+            need_restore = (
+                not storage.blob_path(sha256).exists()
+                or conn.execute(
+                    "SELECT 1 FROM batches WHERE sha256 = ? "
+                    "AND status = 'active' AND suspended_at IS NOT NULL "
+                    "LIMIT 1",
+                    (sha256,),
+                ).fetchone() is not None
+            )
+
+        if need_restore:
+            # Crash-safe order: the verified bytes land first, then one
+            # transaction refreshes the generation and resumes serving.
+            restored = storage.repair_blob(sha256, tmp, len(body))
+            tmp = None
+        else:
+            # Transaction committed: publish the bytes (idempotent).  If GC
+            # moved them to quarantine in parallel, move them back; if
+            # another instance already published identical bytes, nothing
+            # to do.
+            storage.publish(tmp, sha256)
+            if storage.quarantine_path(sha256).exists():
+                storage.move_back_from_quarantine(sha256)
     except BaseException:
-        tmp.unlink(missing_ok=True)
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
         raise
 
     return UploadResponse(
@@ -215,6 +276,7 @@ def upload_archive(batch_id: str, file: UploadFile = File(...)) -> UploadRespons
         sha256=sha256,
         size_bytes=len(body),
         reused_existing_content=reused,
+        restored_batches=restored,
     )
 
 
@@ -223,19 +285,29 @@ def download_archive(batch_id: str) -> FileResponse:
     """Download the original uploaded bytes for an active batch.
 
     Returns 404 for unknown or retired batches (retired numbers stay
-    dead).  Once the response starts, it streams from an open file
+    dead) and 409 for batches suspended by an inspection (the reason is
+    included).  Once the response starts, it streams from an open file
     descriptor, so concurrent garbage collection cannot interrupt it.
     """
     _validate_batch_id(batch_id)
     conn = db.get_conn()
     batch = conn.execute(
-        "SELECT * FROM batches WHERE batch_id = ? AND status = 'active'",
-        (batch_id,),
+        "SELECT * FROM batches WHERE batch_id = ?", (batch_id,)
     ).fetchone()
-    if batch is None:
+    if batch is None or batch["status"] != "active":
         raise HTTPException(
             status_code=404,
             detail=f"no active batch '{batch_id}'",
+        )
+    if batch["suspended_at"] is not None:
+        # Serving was stopped by an inspection; the batch number and its
+        # reference are kept and a repair can resume serving.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"batch '{batch_id}' is suspended since "
+                f"{batch['suspended_at']}: {batch['suspend_reason']}"
+            ),
         )
 
     path = Path(config.BLOB_DIR) / batch["sha256"]
@@ -253,6 +325,85 @@ def download_archive(batch_id: str) -> FileResponse:
         path,
         media_type="application/zip",
         filename=f"{batch_id}.zip",
+    )
+
+
+@app.post("/batches/{batch_id}/inspect", response_model=InspectResponse)
+def inspect_batch(batch_id: str) -> InspectResponse:
+    """巡检: verify the shared original behind a batch.
+
+    The original's bytes are checked against the registered length and
+    SHA-256.  If the file is missing or does not match, *every* active
+    batch referencing it is suspended: queries show the reason, new
+    downloads are rejected, and batch numbers/references are kept.  The
+    file hashing runs outside any database lock, so a slow inspection
+    never blocks repairs or unrelated batches; a verdict is committed
+    only if the original has not changed since it was read (a verdict
+    that lost the race to a repair is reported as ``superseded``).
+    """
+    _validate_batch_id(batch_id)
+    result = storage.inspect_batch(batch_id)
+    if result is None:
+        raise HTTPException(
+            status_code=404, detail=f"unknown batch '{batch_id}'"
+        )
+    return InspectResponse(**result.__dict__)
+
+
+@app.post("/batches/{batch_id}/repair", response_model=RepairResponse)
+def repair_batch(batch_id: str, file: UploadFile = File(...)) -> RepairResponse:
+    """修复: restore the shared original from a retained ZIP.
+
+    The uploaded ZIP must be byte-identical to the batch's registered
+    content (same SHA-256); different content is rejected with 409.
+    The verified bytes are atomically swapped in, then serving resumes
+    for *all* active batches referencing the original.  Retired batches
+    are never revived (409).  If the repair is interrupted (write
+    failure, process exit) nothing unverified is served and the repair
+    can simply be retried.
+    """
+    _validate_batch_id(batch_id)
+    try:
+        body, sha256 = storage.read_and_validate(file.file, config.MAX_UPLOAD_BYTES)
+    except storage.UploadError as exc:
+        raise HTTPException(status_code=413 if "exceeds" in str(exc) else 400,
+                            detail=str(exc)) from exc
+
+    batch = db.get_conn().execute(
+        "SELECT * FROM batches WHERE batch_id = ?", (batch_id,)
+    ).fetchone()
+    if batch is None:
+        raise HTTPException(
+            status_code=404, detail=f"unknown batch '{batch_id}'"
+        )
+    if batch["status"] == "retired":
+        raise HTTPException(
+            status_code=409,
+            detail=f"batch '{batch_id}' was retired and can never be revived",
+        )
+    if batch["sha256"] != sha256:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"uploaded content {sha256} does not match the registered "
+                f"original {batch['sha256']} of batch '{batch_id}'; "
+                "refusing to repair with different content"
+            ),
+        )
+
+    tmp = storage.stage_tmp(body)
+    try:
+        restored = storage.repair_blob(sha256, tmp, len(body))
+        tmp = None
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+
+    return RepairResponse(
+        batch_id=batch_id,
+        sha256=sha256,
+        size_bytes=len(body),
+        restored_batches=restored,
     )
 
 
@@ -304,17 +455,28 @@ def trigger_gc() -> GcResponse:
 
 @app.get("/batches", response_model=BatchListResponse)
 def list_batches(status: str | None = None) -> BatchListResponse:
-    """List batch summaries, optionally filtered by status."""
+    """List batch summaries, optionally filtered by serving state.
+
+    ``status=active`` lists batches currently being served,
+    ``status=suspended`` lists active batches stopped by an inspection
+    (with the reason), ``status=retired`` lists retired numbers.
+    """
     conn = db.get_conn()
     if status is not None:
-        if status not in ("active", "retired"):
+        filters = {
+            "active": "status = 'active' AND suspended_at IS NULL",
+            "suspended": "status = 'active' AND suspended_at IS NOT NULL",
+            "retired": "status = 'retired'",
+        }
+        where = filters.get(status)
+        if where is None:
             raise HTTPException(
                 status_code=400,
-                detail="status filter must be 'active' or 'retired'",
+                detail="status filter must be 'active', 'suspended' or "
+                       "'retired'",
             )
         rows = conn.execute(
-            "SELECT * FROM batches WHERE status = ? ORDER BY batch_id",
-            (status,),
+            f"SELECT * FROM batches WHERE {where} ORDER BY batch_id",
         ).fetchall()
     else:
         rows = conn.execute(
@@ -346,6 +508,10 @@ def storage_summary() -> StorageSummary:
     active = conn.execute(
         "SELECT COUNT(*) FROM batches WHERE status = 'active'"
     ).fetchone()[0]
+    suspended = conn.execute(
+        "SELECT COUNT(*) FROM batches WHERE status = 'active' "
+        "AND suspended_at IS NOT NULL"
+    ).fetchone()[0]
     retired = conn.execute(
         "SELECT COUNT(*) FROM batches WHERE status = 'retired'"
     ).fetchone()[0]
@@ -356,6 +522,7 @@ def storage_summary() -> StorageSummary:
     quarantined = [p for p in config.QUARANTINE_DIR.iterdir() if p.is_file()]
     return StorageSummary(
         active_batches=active,
+        suspended_batches=suspended,
         retired_batches=retired,
         blob_rows=blob_rows,
         blob_files_on_disk=len(blob_files),

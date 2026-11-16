@@ -1,4 +1,0 @@
-# Keep the shared volume mount point in the image/repo while ignoring
-# any runtime contents (blobs, quarantine parts, SQLite WAL files).
-*
-!.gitkeep

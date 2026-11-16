@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from typing import Iterator
 
@@ -26,7 +27,14 @@ CREATE TABLE IF NOT EXISTS blobs (
     sha256          TEXT PRIMARY KEY,
     size_bytes      INTEGER NOT NULL,
     status          TEXT NOT NULL CHECK (status IN ('ready', 'deleting')),
-    quarantine_path TEXT
+    quarantine_path TEXT,
+    -- Token refreshed every time the original's bytes are (re)published or
+    -- repaired.  An inspection compares it before/after hashing the file,
+    -- so a verdict computed from stale bytes is never applied to an
+    -- original that has since been repaired.
+    generation      TEXT NOT NULL DEFAULT '',
+    last_inspected_at TEXT,
+    last_inspect_verdict TEXT
 );
 
 CREATE TABLE IF NOT EXISTS batches (
@@ -35,7 +43,11 @@ CREATE TABLE IF NOT EXISTS batches (
     size_bytes  INTEGER NOT NULL,
     status      TEXT NOT NULL CHECK (status IN ('active', 'retired')),
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    retired_at  TEXT
+    retired_at  TEXT,
+    -- Set when an inspection found the shared original missing/corrupt:
+    -- the batch keeps its number and its reference but is not served.
+    suspended_at TEXT,
+    suspend_reason TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_batches_sha256 ON batches(sha256);
@@ -48,11 +60,48 @@ CREATE TABLE IF NOT EXISTS gc_queue (
 );
 """
 
+# Columns added after the initial release: ALTER existing databases
+# forward (CREATE TABLE IF NOT EXISTS leaves old files untouched).
+_MIGRATIONS = (
+    ("blobs", "generation",
+     "ALTER TABLE blobs ADD COLUMN generation TEXT NOT NULL DEFAULT ''"),
+    ("blobs", "last_inspected_at",
+     "ALTER TABLE blobs ADD COLUMN last_inspected_at TEXT"),
+    ("blobs", "last_inspect_verdict",
+     "ALTER TABLE blobs ADD COLUMN last_inspect_verdict TEXT"),
+    ("batches", "suspended_at",
+     "ALTER TABLE batches ADD COLUMN suspended_at TEXT"),
+    ("batches", "suspend_reason",
+     "ALTER TABLE batches ADD COLUMN suspend_reason TEXT"),
+)
+
 _local = threading.local()
 # Every live connection handed out, across all threads in the process.
 # Connections live for the whole process; reset_connections() drains this.
 _live_conns: set[sqlite3.Connection] = set()
 _all_conns_lock = threading.Lock()
+
+
+def _is_lock_contention(exc: sqlite3.OperationalError) -> bool:
+    return "locked" in str(exc).lower()
+
+
+def _run_with_lock_retry(fn, attempts: int = 30) -> None:
+    """Retry a schema/pragma statement across brief lock conflicts.
+
+    Switching the journal mode or altering the schema needs a lock
+    *upgrade*, which SQLite refuses to wait for via the busy handler (it
+    fails fast to avoid deadlocks).  Two instances starting together on a
+    fresh shared volume hit exactly that, so retry in application code.
+    """
+    for attempt in range(attempts):
+        try:
+            fn()
+            return
+        except sqlite3.OperationalError as exc:
+            if not _is_lock_contention(exc) or attempt == attempts - 1:
+                raise
+            time.sleep(0.1)
 
 
 def _connect() -> sqlite3.Connection:
@@ -66,7 +115,7 @@ def _connect() -> sqlite3.Connection:
     conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
     # WAL is persistent once set; doing it on every connection is harmless
     # and covers a freshly created database on the shared volume.
-    conn.execute("PRAGMA journal_mode = WAL")
+    _run_with_lock_retry(lambda: conn.execute("PRAGMA journal_mode = WAL"))
     conn.execute("PRAGMA synchronous = NORMAL")
     conn.execute("PRAGMA foreign_keys = ON")
     with _all_conns_lock:
@@ -98,7 +147,17 @@ def reset_connections() -> None:
 def init_db() -> None:
     config.ensure_layout()
     conn = get_conn()
-    conn.executescript(_SCHEMA)
+    _run_with_lock_retry(lambda: conn.executescript(_SCHEMA))
+    for table, column, ddl in _MIGRATIONS:
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            try:
+                _run_with_lock_retry(lambda: conn.execute(ddl))
+            except sqlite3.OperationalError as exc:
+                # Two instances starting together can race the ALTER; the
+                # loser sees the column already present, which is fine.
+                if "duplicate column" not in str(exc).lower():
+                    raise
 
 
 @contextmanager

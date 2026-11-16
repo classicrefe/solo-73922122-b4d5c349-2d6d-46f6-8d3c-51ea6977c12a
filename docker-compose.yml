@@ -1,7 +1,8 @@
 # Two API replicas sharing one named data volume.
 # SQLite in WAL mode tolerates multi-process access; every mutating
 # endpoint takes a short BEGIN IMMEDIATE lock, and downloads hold no
-# database lock while streaming.
+# database lock while streaming.  Inspection hashes files outside any
+# lock, so a stalled inspection never blocks repairs or other batches.
 services:
   archive-api-a:
     build: .
